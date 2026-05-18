@@ -758,25 +758,8 @@ def download_bootstrap_configs(vm: VManageSession, devices: list, site_id: str) 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main() -> None:
-    print()
-    print(SEP)
-    print("  Cisco SD-WAN – vManage WAN Edge Deployment Script")
-    print(f"  Controller : {VMANAGE_URL}")
-    print(f"  Code ver.  : 20.15.4.4")
-    print(SEP)
-
-    print()
-    username = input("vManage Username : ").strip()
-    if not username:
-        abort("Username cannot be empty.")
-    password = getpass.getpass("vManage Password : ")
-    if not password:
-        abort("Password cannot be empty.")
-    site_id  = input("SD-WAN Site ID   : ").strip()
-    if not site_id:
-        abort("Site ID cannot be empty.")
-
+def _onboard_site(vm, username: str, password: str, site_id: str) -> None:
+    """Run the full onboarding workflow for a single site."""
     # ------------------------------------------------------------------
     # Step 0 – Load CSV
     # ------------------------------------------------------------------
@@ -801,13 +784,6 @@ def main() -> None:
     # Step 1 – Connect + locate devices
     # ------------------------------------------------------------------
     banner("STEP 1 – Connecting to vManage & Locating Devices")
-    try:
-        vm = VManageSession(VMANAGE_URL, username, password)
-    except requests.exceptions.ConnectionError as exc:
-        abort(
-            f"Cannot reach vManage at {VMANAGE_URL}.",
-            f"Check VPN / network access.\nError: {exc}",
-        )
 
     info("Fetching WAN edge inventory...")
     all_edges = get_wan_edge_inventory(vm)
@@ -867,6 +843,54 @@ def main() -> None:
     print("  2. Insert into the WAN edge and power on – ZTP will auto-onboard")
     print("  3. Monitor progress: Monitor > Devices in vManage")
     print()
+
+
+def main() -> None:
+    print()
+    print(SEP)
+    print("  Cisco SD-WAN – vManage WAN Edge Deployment Script")
+    print(f"  Controller : {VMANAGE_URL}")
+    print(f"  Code ver.  : 20.15.4.4")
+    print(SEP)
+
+    print()
+    username = input("vManage Username : ").strip()
+    if not username:
+        abort("Username cannot be empty.")
+    password = getpass.getpass("vManage Password : ")
+    if not password:
+        abort("Password cannot be empty.")
+
+    # Authenticate once; reuse the session for all sites
+    banner("Connecting to vManage")
+    try:
+        vm = VManageSession(VMANAGE_URL, username, password)
+    except requests.exceptions.ConnectionError as exc:
+        abort(
+            f"Cannot reach vManage at {VMANAGE_URL}.",
+            f"Check VPN / network access.\nError: {exc}",
+        )
+    ok("Authenticated successfully.")
+
+    while True:
+        print()
+        site_id = input("SD-WAN Site ID (or 'x' to exit) : ").strip()
+        if site_id.lower() in ("x", "exit", "quit", "q"):
+            print()
+            print("  Exiting. Goodbye.")
+            print()
+            break
+        if not site_id:
+            warn("Site ID cannot be empty – try again.")
+            continue
+        try:
+            _onboard_site(vm, username, password, site_id)
+        except SystemExit:
+            # abort() calls sys.exit(1); catch it so the loop continues
+            print()
+            ans = input("  Press Enter to onboard another site, or 'x' to exit: ").strip().lower()
+            if ans in ("x", "exit", "quit", "q"):
+                break
 
 
 if __name__ == "__main__":
