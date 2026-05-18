@@ -33,6 +33,7 @@ import time
 import getpass
 import urllib3
 import requests
+import openpyxl
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,14 @@ CONFIG_GROUP_NAME = "onboard_r1_pppoe_r2_pppoe"
 CSV_PATH = (
     r"/mnt/c/Users/nick.oneill/OneDrive - Maintel Europe Limited"
     r"/Southern Coops - Rollout docs/vmanage-import-sc.csv"
+)
+ROLLOUT_TRACKER_PATH = (
+    r"/mnt/c/Users/nick.oneill/OneDrive - Maintel Europe Limited"
+    r"/Southern Coops - Rollout docs/NOF2025 Rollout tracker.xlsx"
+)
+SCOOP_INVENTORY_PATH = (
+    r"/mnt/c/Users/nick.oneill/OneDrive - Maintel Europe Limited"
+    r"/Southern Coops - IP Addresses/SCOOP Remote Site Inventory.xlsx"
 )
 
 # Suppress SSL warnings for self-signed controller certificate
@@ -588,36 +597,54 @@ def deploy_config_group(vm: VManageSession, group_id: str, devices: list) -> Non
 
 def _find_recent_deploy_action(vm: VManageSession, uuids: list) -> str:
     """
-    Query the vManage task list and return the action ID of the most recent
-    config-group deploy that involves any of the given device UUIDs.
-    Returns an empty string if nothing can be matched.
+    Poll /dataservice/device/action/status/tasks for a running deploy job
+    that involves any of the given device UUIDs. Retries for up to 30 s
+    to allow vManage time to register the task after the deploy call.
+    Returns the processId string, or "" if nothing matched.
     """
-    resp = vm.get("/dataservice/device/action/status/tasks")
-    if resp.status_code != 200:
-        # Older endpoint name
-        resp = vm.get("/dataservice/device/action/list")
-    if resp.status_code != 200:
-        return ""
+    uuid_set = set(u.lower() for u in uuids)
+    deadline = time.time() + 30
 
-    try:
-        tasks = resp.json().get("data", resp.json()) if isinstance(resp.json(), dict) else resp.json()
-        if not isinstance(tasks, list):
-            tasks = resp.json().get("runningTasks", []) or resp.json().get("tasks", [])
+    while time.time() < deadline:
+        resp = vm.get("/dataservice/device/action/status/tasks")
+        if resp.status_code != 200:
+            time.sleep(5)
+            continue
 
-        uuid_set = set(uuids)
-        for task in tasks:
-            # Skip completed tasks that aren't deploy-related
-            action_type = (task.get("actionConfig", "") + task.get("name", "") + task.get("type", "")).lower()
-            if "deploy" not in action_type and "config" not in action_type:
-                continue
-            task_devices = task.get("deviceUUIDs", task.get("deviceIds", []))
-            if any(u in uuid_set for u in task_devices):
-                action_id = task.get("processId", task.get("taskId", task.get("id", "")))
-                if action_id:
-                    info(f"  Matched deploy task: {action_id}")
-                    return str(action_id)
-    except Exception:
-        pass
+        try:
+            tasks = resp.json().get("runningTasks", [])
+            for task in tasks:
+                process_id = str(task.get("processId", ""))
+                if not process_id:
+                    continue
+
+                # Match on device UUIDs embedded in the task
+                task_devices = (
+                    task.get("deviceUUIDs", [])
+                    or task.get("deviceIds", [])
+                    or [d.get("deviceId", "") for d in task.get("deviceList", [])]
+                )
+                task_devices_lower = [str(d).lower() for d in task_devices]
+
+                # Also match on action type
+                action_type = " ".join([
+                    str(task.get("actionConfig", "")),
+                    str(task.get("name", "")),
+                    str(task.get("action", "")),
+                    str(task.get("type", "")),
+                ]).lower()
+
+                device_match = any(u in task_devices_lower for u in uuid_set)
+                type_match   = "deploy" in action_type or "config" in action_type
+
+                if device_match or (type_match and tasks):
+                    info(f"  Matched deploy task: processId={process_id}")
+                    return process_id
+        except Exception:
+            pass
+
+        time.sleep(5)
+
     return ""
 
 
@@ -627,7 +654,27 @@ def _poll_action(vm: VManageSession, action_id: str,
     deadline = time.time() + timeout
 
     while time.time() < deadline:
+        # Primary: per-action status endpoint
         resp = vm.get(f"/dataservice/device/action/status/{action_id}")
+
+        if resp.status_code == 404:
+            # Fallback: check runningTasks list and look for our processId
+            tr = vm.get("/dataservice/device/action/status/tasks")
+            if tr.status_code == 200:
+                running = tr.json().get("runningTasks", [])
+                match = next((t for t in running if str(t.get("processId", "")) == action_id), None)
+                if match is None:
+                    # No longer in running list – may have completed
+                    ok(f"{label} is no longer in the running task list – assumed complete.")
+                    return
+                status = str(match.get("status", "in_progress")).lower()
+                info(f"  {label}: {status} (from runningTasks)")
+                if status in ("success", "done", "success_scheduled"):
+                    ok(f"{label} completed successfully.")
+                    return
+                time.sleep(15)
+                continue
+
         if resp.status_code != 200:
             warn(f"Status poll returned HTTP {resp.status_code} – retrying...")
             time.sleep(10)
@@ -643,7 +690,7 @@ def _poll_action(vm: VManageSession, action_id: str,
             f"Failure={counts.get('Failure','?')}"
         )
 
-        if status in ("success", "done"):
+        if status in ("success", "done", "success_scheduled"):
             ok(f"{label} completed successfully.")
             return
 
@@ -845,6 +892,97 @@ def _onboard_site(vm, username: str, password: str, site_id: str) -> None:
     print()
 
 
+def generate_ping_template(site_ids: list) -> None:
+    """
+    Look up network details for each onboarded site and print a PING IP TEMPLATE.
+    site_ids: list of SD-WAN site IDs entered during the session (e.g. '30409').
+    """
+    if not site_ids:
+        return
+
+    # ------------------------------------------------------------------
+    # Load rollout tracker (header is row index 1, data starts at row 2)
+    # col indices (0-based): A=0, G=6, N=13, Q=16, X=23
+    # ------------------------------------------------------------------
+    try:
+        rt_wb = openpyxl.load_workbook(ROLLOUT_TRACKER_PATH, read_only=True, data_only=True)
+        rt_ws = rt_wb["Main"]
+    except Exception as exc:
+        warn(f"Could not open rollout tracker: {exc}")
+        rt_ws = None
+
+    # Build store_number -> row dict (strip leading zeros from col A)
+    store_rows = {}
+    if rt_ws:
+        for row in rt_ws.iter_rows(min_row=3, values_only=True):
+            if row[0] is not None:
+                store_num = str(row[0]).strip().strip("'").lstrip("0") or "0"
+                # If we already have a populated entry for this store, keep it
+                if store_num in store_rows and any(store_rows[store_num][i] for i in (6, 13, 16, 23)):
+                    continue
+                store_rows[store_num] = row
+        rt_wb.close()
+
+    # ------------------------------------------------------------------
+    # Load SCOOP inventory – Maintel ISP sheet
+    # col C (idx 2) = TTB/PXC username  → WAN IP from col B (idx 1)
+    # col G (idx 6) = BT username       → WAN IP from col F (idx 5)
+    # ------------------------------------------------------------------
+    wan_username_map: dict[str, str] = {}   # username -> WAN IP
+    try:
+        inv_wb = openpyxl.load_workbook(SCOOP_INVENTORY_PATH, read_only=True, data_only=True)
+        inv_ws = inv_wb["Maintel ISP"]
+        for row in inv_ws.iter_rows(min_row=3, values_only=True):
+            # TTB/PXC: col C username (idx 2) → col B IP (idx 1)
+            if row[2] and row[1]:
+                wan_username_map[str(row[2]).strip().strip("'")] = str(row[1]).strip().strip("'")
+            # BT: col G username (idx 6) → col F IP (idx 5)
+            if len(row) > 6 and row[6] and row[5]:
+                wan_username_map[str(row[6]).strip().strip("'")] = str(row[5]).strip().strip("'")
+        inv_wb.close()
+    except Exception as exc:
+        warn(f"Could not open SCOOP inventory: {exc}")
+
+    # ------------------------------------------------------------------
+    # Build per-store info and print template
+    # ------------------------------------------------------------------
+    print()
+    print("PING IP TEMPLATE")
+    print("================")
+    print()
+
+    for site_id in site_ids:
+        store_num = site_id[-4:].lstrip("0") or "0"
+
+        row = store_rows.get(store_num)
+
+        if not row:
+            print(f"# (store {store_num} not found in rollout tracker)")
+            continue
+
+        r1_mgmt  = str(row[6]).strip().strip("'")  if row[6]  else ""
+        r1_ppp   = str(row[13]).strip().strip("'") if row[13] else ""
+        r2_mgmt  = str(row[16]).strip().strip("'") if row[16] else ""
+        r2_ppp   = str(row[23]).strip().strip("'") if row[23] else ""
+
+        r1_wan = wan_username_map.get(r1_ppp, "") if r1_ppp else ""
+        r2_wan = wan_username_map.get(r2_ppp, "") if r2_ppp else ""
+
+        print("#")
+        print(f"{store_num}")
+        print("#")
+        if r1_wan:
+            print(r1_wan)
+        if r1_mgmt:
+            print(r1_mgmt)
+        if r2_wan:
+            print(r2_wan)
+        if r2_mgmt:
+            print(r2_mgmt)
+        if not any([r1_wan, r1_mgmt, r2_wan, r2_mgmt]):
+            print(f"# (no IP data in tracker for store {store_num})")
+
+
 def main() -> None:
     print()
     print(SEP)
@@ -872,10 +1010,13 @@ def main() -> None:
         )
     ok("Authenticated successfully.")
 
+    completed_sites: list[str] = []
+
     while True:
         print()
         site_id = input("SD-WAN Site ID (or 'x' to exit) : ").strip()
         if site_id.lower() in ("x", "exit", "quit", "q"):
+            generate_ping_template(completed_sites)
             print()
             print("  Exiting. Goodbye.")
             print()
@@ -885,6 +1026,7 @@ def main() -> None:
             continue
         try:
             _onboard_site(vm, username, password, site_id)
+            completed_sites.append(site_id)
         except SystemExit:
             # abort() calls sys.exit(1); catch it so the loop continues
             print()
