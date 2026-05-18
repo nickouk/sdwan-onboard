@@ -471,6 +471,14 @@ _VARS_EXCLUDED = {
 }
 
 
+# Variables that must be skipped if their value is zero (vManage rejects 0)
+_ZERO_INVALID_VARS = {
+    "tloc_bandwidth_up", "tloc_bandwidth_down",
+    "wan_bandwidth_up", "wan_bandwidth_down",
+    "wan_shapingRate",
+}
+
+
 def _coerce(name: str, value: str):
     """Cast value to the correct type for vManage."""
     if name in _NUMERIC_VARS:
@@ -494,7 +502,11 @@ def _build_variables(csv_row: dict) -> list:
         name = _CSV_HEADER_MAP.get(k, k)
         if name in _VARS_EXCLUDED or k in _VARS_EXCLUDED:
             continue
-        result.append({"name": name, "value": _coerce(name, v)})
+        coerced = _coerce(name, v)
+        # vManage rejects 0 for bandwidth variables – skip if not set
+        if name in _ZERO_INVALID_VARS and coerced == 0:
+            continue
+        result.append({"name": name, "value": coerced})
     return result
 
 
@@ -969,7 +981,7 @@ def generate_ping_template(site_ids: list) -> None:
         r2_wan = wan_username_map.get(r2_ppp, "") if r2_ppp else ""
 
         print("#")
-        print(f"{store_num}")
+        print(f"# {store_num}")
         print("#")
         if r1_wan:
             print(r1_wan)
