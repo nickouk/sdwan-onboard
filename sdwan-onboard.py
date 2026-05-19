@@ -735,7 +735,12 @@ def download_bootstrap_configs(vm: VManageSession, devices: list, site_id: str) 
     for device in devices:
         tag      = device["_tag"]
         uuid     = device.get("uuid", "")
-        hostname = device.get("host-name", device.get("hostName", device["_serial"]))
+        hostname = (
+            device.get("host-name")
+            or device.get("hostName")
+            or device.get("_csv_row", {}).get("Host Name", "")
+            or device["_serial"]
+        )
 
         info(f"Requesting bootstrap for {tag} ({hostname}, uuid={uuid})...")
 
